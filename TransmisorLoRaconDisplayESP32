@@ -4,10 +4,14 @@
 #include "DHT.h"
 #include <ADS1115_WE.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 
-// -------------------------- CONFIG WIFI --------------------------
+// -------------------------- CONFIG WIFI (Display AP) --------------------------
 const char* WIFI_SSID = "Display_AP";
 const char* WIFI_PASS = "12345678";
+
+// IP fija del ESP32 Display (si usas AP)
+#define DISPLAY_IP "http://192.168.4.1/telemetry?"
 
 WiFiServer server(80);
 
@@ -36,14 +40,14 @@ ADS1115_WE ads = ADS1115_WE(0x48);
 #define FWD_PIN 36
 #define RFL_PIN 39
 
-// Relé SSR
+// Relay SSR
 #define RELAY_PIN 12
 
-// Intervalo de envío
+// Intervalo de envío telemetría
 unsigned long lastSendTime = 0;
 const unsigned long sendInterval = 5000;
 
-// Variables globales medidas
+// Variables medidas
 float voltage = 0;
 float current = 0;
 float power = 0;
@@ -59,7 +63,7 @@ float humidity = 0;
 bool relayStatus = false;
 bool safetyLock = false;
 
-// Eventos LoRa
+// LoRa Events
 static RadioEvents_t RadioEvents;
 
 // -------------------------- FUNCIONES ADC --------------------------
@@ -108,6 +112,7 @@ float calculateSWR(float FWD, float RFL) {
 
 // -------------------------- PROTECCIONES --------------------------
 void aplicarProtecciones() {
+
     bool failV = (voltage < 200.0 || voltage > 240.0);
     bool failI = (current > 10.0);
 
@@ -115,19 +120,20 @@ void aplicarProtecciones() {
         safetyLock = true;
         relayStatus = false;
         digitalWrite(RELAY_PIN, LOW);
-        Serial.println("⚠ Protección ACTIVADA — RELÉ DESACTIVADO");
+
+        Serial.println("⚠ PROTECCIÓN ACTIVADA — RELÉ DESACTIVADO");
     } else {
         safetyLock = false;
     }
 }
 
-// -------------------------- RECEPCIÓN LORA --------------------------
+// -------------------------- RECEPCIÓN COMANDOS LORA --------------------------
 
 void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
     payload[size] = '\0';
     String cmd = String((char*)payload);
 
-    Serial.print("Comando recibido -> ");
+    Serial.print("CMD LoRa -> ");
     Serial.println(cmd);
 
     if (cmd.startsWith("CMD:RELAY=")) {
@@ -137,8 +143,7 @@ void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
             relayStatus = (state == 1);
             digitalWrite(RELAY_PIN, relayStatus ? HIGH : LOW);
         }
-
-        Serial.printf("Relé cambiado por comando remoto: %d\n", relayStatus);
+        Serial.printf("Relé cambiado por LoRa → %d\n", relayStatus);
     }
 
     Radio.Rx(0);
@@ -155,25 +160,25 @@ void setupLoRa() {
     Radio.Init(&RadioEvents);
 
     Radio.SetChannel(RF_FREQUENCY);
-    Radio.SetTxConfig(
-        MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BW, LORA_SF, LORA_CR,
-        8, false, true, 0, 0, false, 3000
-    );
+    Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BW,
+                      LORA_SF, LORA_CR, 8, false, true,
+                      0, 0, false, 3000);
 
     Radio.Rx(0);
 }
 
-// -------------------------- CONTROL DESDE DISPLAY (WiFi) --------------------------
+// -------------------------- RECEPCIÓN DISPLAY (WiFi) --------------------------
 
 void recibirComandoWiFi() {
+
     WiFiClient client = server.available();
     if (!client) return;
 
     String req = client.readStringUntil('\r');
-    Serial.println(req);
     client.flush();
 
     if (req.indexOf("/relay?state=") != -1) {
+
         int pos = req.indexOf("state=");
         int newState = req.substring(pos + 6).toInt();
 
@@ -182,7 +187,7 @@ void recibirComandoWiFi() {
             digitalWrite(RELAY_PIN, relayStatus ? HIGH : LOW);
         }
 
-        Serial.printf("Relé modificado desde Display -> %d\n", relayStatus);
+        Serial.printf("Relé modificado desde Display → %d\n", relayStatus);
     }
 
     client.println("HTTP/1.1 200 OK");
@@ -193,8 +198,36 @@ void recibirComandoWiFi() {
     client.stop();
 }
 
+// -------------------------- ENVÍO TELEMETRÍA AL DISPLAY --------------------------
+
+void enviarDatosAlDisplay() {
+
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+
+    String url = String(DISPLAY_IP) +
+        "V=" + String(voltage, 2) +
+        "&C=" + String(current, 2) +
+        "&P=" + String(power, 2) +
+        "&Cons=" + String(consumption_wh, 2) +
+        "&FWD=" + String(fwdPower, 2) +
+        "&RFL=" + String(rflPower, 2) +
+        "&SWR=" + String(swr, 2) +
+        "&T=" + String(temperature, 1) +
+        "&H=" + String(humidity, 1) +
+        "&SSR=" + String(relayStatus ? 1 : 0);
+
+    http.begin(url);
+    int httpCode = http.GET();
+    http.end();
+
+    Serial.printf("Telemetría enviada al Display (%d)\n", httpCode);
+}
+
 // -------------------------- SETUP --------------------------
 void setup() {
+
     Serial.begin(115200);
     Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
 
@@ -211,10 +244,11 @@ void setup() {
 
     setupLoRa();
 
-    // ------ WIFI ------
+    // ---------------- WIFI → Conectar al Display ----------------
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.print("Conectando al Display AP");
+
+    Serial.print("Conectando al Display AP ");
 
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
@@ -227,14 +261,15 @@ void setup() {
 
     server.begin();
 
-    Serial.println("Transmisor LoRa — Inicializado");
+    Serial.println("Transmisor LoRa — Inicializado OK");
 }
 
 // -------------------------- LOOP --------------------------
 void loop() {
+
     unsigned long now = millis();
 
-    recibirComandoWiFi();   // <----- COMANDOS DISPLAY
+    recibirComandoWiFi();   // Recibir control del display
 
     if (now - lastSendTime >= sendInterval) {
 
@@ -262,11 +297,15 @@ void loop() {
             relayStatus ? 1 : 0
         );
 
-        Serial.printf("TX -> %s\n", txPacket);
+        Serial.printf("TX LoRa -> %s\n", txPacket);
 
         Radio.Send((uint8_t *)txPacket, strlen(txPacket));
+
+        // ---- ENVÍO DE TELEMETRÍA AL DISPLAY ----
+        enviarDatosAlDisplay();
 
         lastSendTime = now;
     }
 }
+
 
