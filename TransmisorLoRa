@@ -1,0 +1,225 @@
+#include <LoRaWan_APP.h>
+#include <Wire.h>
+#include <SPI.h>
+#include "DHT.h"
+#include <ADS1115_WE.h>
+
+// -------------------------- CONFIGURACIONES --------------------------
+
+// --- LoRa ---
+#define RF_FREQUENCY 915000000
+#define TX_OUTPUT_POWER 7
+#define LORA_BW 0
+#define LORA_SF 7
+#define LORA_CR 1
+
+// --- Sensores ---
+#define DHTPIN 14
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+ADS1115_WE ads = ADS1115_WE(0x48); // ADS1115 para corriente ACS712
+
+// AD7705 (ZMPT101B)
+#define AD7705_DRDY 34
+#define AD7705_MISO 19
+#define AD7705_MOSI 23
+#define AD7705_SCLK 18
+#define AD7705_CS   5
+
+// RF inputs
+#define FWD_PIN 36
+#define RFL_PIN 39
+
+// Relé SSR
+#define RELAY_PIN 12
+
+// Intervalo de envío
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 5000;
+
+// Variables globales medidas
+float voltage = 0;
+float current = 0;
+float power = 0;
+float consumption_wh = 0;  // Wh acumulado mensual
+
+float fwdPower = 0;
+float rflPower = 0;
+float swr = 1.0;
+
+float temperature = 0;
+float humidity = 0;
+
+bool relayStatus = false;
+
+static RadioEvents_t RadioEvents;
+
+// -------------------------- FUNCIONES ADC --------------------------
+
+// AD7705 lectura continua canal ZMPT101B
+long readAD7705() {
+    digitalWrite(AD7705_CS, LOW);
+    delayMicroseconds(3);
+    long value = 0;
+    for (int i = 0; i < 16; i++) {
+        value <<= 1;
+        digitalWrite(AD7705_SCLK, HIGH);
+        delayMicroseconds(1);
+        if (digitalRead(AD7705_MISO)) value++;
+        digitalWrite(AD7705_SCLK, LOW);
+        delayMicroseconds(1);
+    }
+    digitalWrite(AD7705_CS, HIGH);
+    return value;
+}
+
+// Conversión ZMPT101B
+float readVoltage() {
+    long raw = readAD7705();
+    float v = (raw * 5.0 / 65535.0) * 220;  
+    return v;
+}
+
+// ACS712 corriente (ADS1115)
+float readCurrent() {
+    float voltage = ads.getResult_mV() / 1000.0;
+    float offset = 2.5;
+    float sensitivity = 0.066; // 30A
+    float current = (voltage - offset) / sensitivity;
+    return current;
+}
+
+// RF Measurements
+float readRFPower(int pin) {
+    int adc = analogRead(pin);
+    float volts = adc * (3.3 / 4095.0);
+    return volts * 100.0;  
+}
+
+float calculateSWR(float FWD, float RFL) {
+    if (FWD <= 0) return 1;
+    float rho = sqrt(RFL / FWD);
+    return (1 + rho) / (1 - rho);
+}
+
+// -------------------------- PROTECCIONES --------------------------
+
+void aplicarProtecciones() {
+    bool failV = (voltage < 200.0 || voltage > 240.0);
+    bool failI = (current > 10.0);
+
+    if (failV || failI) {
+        relayStatus = false;
+        digitalWrite(RELAY_PIN, LOW);
+        Serial.println("⚠ Protección ACTIVADA — RELÉ DESACTIVADO");
+    }
+}
+
+// -------------------------- RECEPCIÓN LORA --------------------------
+
+void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
+    payload[size] = '\0';
+    String cmd = String((char*)payload);
+
+    Serial.print("Comando recibido -> ");
+    Serial.println(cmd);
+
+    if (cmd.startsWith("CMD:RELAY=")) {
+        int state = cmd.substring(11).toInt();
+        relayStatus = (state == 1);
+        digitalWrite(RELAY_PIN, relayStatus ? HIGH : LOW);
+
+        Serial.printf("Relé cambiado por comando remoto: %d\n", relayStatus);
+    }
+
+    Radio.Rx(0);
+}
+
+void OnTxDone() {
+    Radio.Rx(0);
+}
+
+// -------------------------- SETUP LORA --------------------------
+
+void setupLoRa() {
+    RadioEvents.TxDone = OnTxDone;
+    RadioEvents.RxDone = OnRxDone;
+    Radio.Init(&RadioEvents);
+
+    Radio.SetChannel(RF_FREQUENCY);
+    Radio.SetTxConfig(
+        MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BW, LORA_SF, LORA_CR,
+        8, false, true, 0, 0, false, 3000
+    );
+
+    Radio.Rx(0);
+}
+
+// -------------------------- SETUP --------------------------
+
+void setup() {
+    Serial.begin(115200);
+    Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
+
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
+
+    dht.begin();
+    ads.init();
+
+    // AD7705 init
+    pinMode(AD7705_CS, OUTPUT);
+    pinMode(AD7705_MISO, INPUT);
+    pinMode(AD7705_MOSI, OUTPUT);
+    pinMode(AD7705_SCLK, OUTPUT);
+
+    setupLoRa();
+
+    Serial.println("Transmisor LoRa — Inicializado");
+}
+
+// -------------------------- LOOP --------------------------
+
+void loop() {
+    unsigned long now = millis();
+
+    if (now - lastSendTime >= sendInterval) {
+
+        // ---------------- MEDICIONES ----------------
+        voltage = readVoltage();
+        current = readCurrent();
+        power = voltage * current;  
+
+        // Consumo Wh acumulado mensual
+        consumption_wh += (power / 3600.0) * 5.0;
+
+        temperature = dht.readTemperature();
+        humidity = dht.readHumidity();
+
+        fwdPower = readRFPower(FWD_PIN);
+        rflPower = readRFPower(RFL_PIN);
+        swr = calculateSWR(fwdPower, rflPower);
+
+        aplicarProtecciones();  // PROTECCIÓN
+
+        // ---------------- PAYLOAD ----------------
+        char txPacket[200];
+        snprintf(txPacket, sizeof(txPacket),
+                 "V:%.2f,C:%.2f,P:%.2f,Cons:%.2f,FWD:%.2f,RFL:%.2f,SWR:%.2f,T:%.1f,H:%.1f,SSR:%d",
+                 voltage, current, power, consumption_wh,
+                 fwdPower, rflPower, swr,
+                 temperature, humidity,
+                 relayStatus ? 1 : 0);
+
+        Serial.printf("TX -> %s\n", txPacket);
+
+        // Enviar LoRa
+        Radio.Send((uint8_t *)txPacket, strlen(txPacket));
+
+        // ---------------- ENVÍO A DISPLAY (ESP32 AP) ----------------
+        Serial.println(txPacket);
+
+        lastSendTime = now;
+    }
+}
